@@ -5,11 +5,15 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Cookie
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
+from pydantic import BaseModel
 import os
+import json
+import secrets
 from pathlib import Path
+from typing import Optional
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +22,35 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# Session storage (in-memory)
+sessions = {}
+
+# Load teachers from JSON file
+def load_teachers():
+    teachers_file = os.path.join(Path(__file__).parent, "teachers.json")
+    with open(teachers_file, 'r') as f:
+        data = json.load(f)
+        return data['teachers']
+
+teachers = load_teachers()
+
+# Pydantic models
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+# Authentication dependency
+async def get_current_user(session_token: Optional[str] = Cookie(None)):
+    if session_token and session_token in sessions:
+        return sessions[session_token]
+    return None
+
+async def require_auth(session_token: Optional[str] = Cookie(None)):
+    user = await get_current_user(session_token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user
 
 # In-memory activity database
 activities = {
@@ -83,14 +116,46 @@ def root():
     return RedirectResponse(url="/static/index.html")
 
 
+@app.post("/login")
+async def login(credentials: LoginRequest):
+    """Authenticate a teacher"""
+    for teacher in teachers:
+        if teacher['username'] == credentials.username and teacher['password'] == credentials.password:
+            # Create session token
+            session_token = secrets.token_urlsafe(32)
+            sessions[session_token] = credentials.username
+            
+            response = JSONResponse(content={"message": "Login successful", "username": credentials.username})
+            response.set_cookie(key="session_token", value=session_token, httponly=True, samesite="lax")
+            return response
+    
+    raise HTTPException(status_code=401, detail="Invalid credentials")
+
+@app.post("/logout")
+async def logout(session_token: Optional[str] = Cookie(None)):
+    """Logout a teacher"""
+    if session_token and session_token in sessions:
+        del sessions[session_token]
+    
+    response = JSONResponse(content={"message": "Logged out successfully"})
+    response.delete_cookie(key="session_token")
+    return response
+
+@app.get("/auth/status")
+async def auth_status(user: Optional[str] = Depends(get_current_user)):
+    """Check authentication status"""
+    if user:
+        return {"authenticated": True, "username": user}
+    return {"authenticated": False}
+
 @app.get("/activities")
 def get_activities():
     return activities
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
-    """Sign up a student for an activity"""
+async def signup_for_activity(activity_name: str, email: str, user: str = Depends(require_auth)):
+    """Sign up a student for an activity (requires authentication)"""
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +176,8 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
-    """Unregister a student from an activity"""
+async def unregister_from_activity(activity_name: str, email: str, user: str = Depends(require_auth)):
+    """Unregister a student from an activity (requires authentication)"""
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
